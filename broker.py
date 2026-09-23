@@ -156,7 +156,7 @@ def run_interview(stream, model, cfg, activation_index, digest):
     tmpl = _load_template(str(ptdir / "interview.md"))
     sysp = (tmpl.replace("{n}", str(activation_index))
                 .replace("{record}", _defang(record.strip()) or "(empty)")
-                .replace("{digest}", digest or "(no history yet)"))
+                .replace("{digest}", _defang(digest) or "(no history yet)"))
     vote_prompt = _load_template(str(ptdir / "interview_vote.md"))
     predict = int(ic.get("predict", 1500))
     max_reask = int(ic.get("max_reask", 2))

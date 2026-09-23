@@ -37,6 +37,9 @@ def main():
                     help="run a single activation for the first model, then exit")
     ap.add_argument("--model", help="restrict the run to one model id")
     ap.add_argument("--models", help="comma-separated cohort override (wins over --model)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start every stream's activation count at 0 again (worlds/records are kept; "
+                         "old history is rotated, not deleted). Default: resume persisted counts.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -83,8 +86,23 @@ def main():
         print(f"ensuring container for {s} ...")
         sandbox.ensure_container(s, cfg)
 
-    counts = {s: 0 for s in streams}
+    # Resume: a stream's lifetime activation count lives in its world (state.json), so a restart
+    # continues numbering, cadence and the interview's "{n}" where it left off instead of at 0.
+    worlds = cfg["paths"]["worlds"]
+    if args.fresh:
+        for s in streams:
+            sandbox.reset_counts(worlds, s)
+    counts = {s: int(sandbox.load_state(worlds, s).get("activations", 0)) for s in streams}
+    resumed = {s: n for s, n in counts.items() if n}
+    if resumed:
+        hi = max(resumed, key=resumed.get)
+        print(f"resuming {len(resumed)}/{len(streams)} stream(s) from persisted counts "
+              f"(highest: {hi} at act {resumed[hi]}); use --fresh to start counts over")
     cap = sched["max_activations_per_model"]
+    if cap and all(counts[s] >= cap for s in streams):
+        print(f"every stream is already at max_activations_per_model={cap}; "
+              "nothing to run (re-run with --fresh, or raise the cap).")
+        return
     snap_every = cfg.get("snapshot_every", 0)
     interview_every = int(cfg.get("interview", {}).get("every", 0))
 
@@ -93,14 +111,17 @@ def main():
         idx = counts[s] + 1
         act = broker.run_activation(s, model, cfg, idx)
         logger.log_activation(s, act)
-        if snap_every and idx % snap_every == 0:
-            logger.snapshot_world(s, idx, sandbox.world_home(cfg["paths"]["worlds"], s))
         counts[s] = idx
+        sandbox.save_state(worlds, s, activations=idx, run_id=logger.run_id, model=model)
+        sandbox.append_history(worlds, s, logs.history_entry(act, logger.run_id))
+        if snap_every and idx % snap_every == 0:
+            logger.snapshot_world(s, idx, sandbox.world_home(worlds, s))
         print(f"[{s}] act {idx} end={act['end_reason']} "
               f"tok={act['total_gen_tokens']} steps={len(act['steps'])} "
               f"{act['wall_ms']}ms")
         if interview_every and idx % interview_every == 0:
-            digest = logs.build_interview_digest(logger.model_dir(s))
+            digest = logs.build_interview_digest(logger.model_dir(s),
+                                                 history=sandbox.history_path(worlds, s))
             iv = broker.run_interview(s, model, cfg, idx, digest)
             logger.log_interview(s, idx, iv)
             act["interview"] = iv

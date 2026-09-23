@@ -6,9 +6,11 @@ the host (persistent world + live observability), and CPU / memory / PID / disk
 footprints are capped. Command output is bounded INSIDE the container (see exec_cmd)
 so a runaway command can never flood the host broker's memory.
 """
+import json
 import re
 import pathlib
 import subprocess
+import time
 
 
 def sanitize(name):
@@ -45,6 +47,56 @@ def mark_withdrawn(worlds_root, stream, reason="withdrawn"):
     p = withdrawn_marker(worlds_root, stream)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(reason + "\n")
+
+
+# --- Per-stream persistent state (OUTSIDE the container's view) ------------------------------
+# worlds/<stream>/state.json   — {"activations": N, ...}: the stream's lifetime activation count.
+# worlds/<stream>/history.jsonl — one compact line per activation (index, end reason, command
+#                                 count, record head), the raw material for the interview digest.
+# Both sit beside WITHDRAWN at the world root; only world_home() (…/home) is bind-mounted, so the
+# model can neither read nor edit them. A restart resumes counts from here instead of at 0 — which
+# used to silently reset activation numbering, the interview cadence, and the interview's "you
+# have been through N activations" every time the scheduler relaunched.
+def state_path(worlds_root, stream):
+    return pathlib.Path(worlds_root) / sanitize(stream) / "state.json"
+
+
+def history_path(worlds_root, stream):
+    return pathlib.Path(worlds_root) / sanitize(stream) / "history.jsonl"
+
+
+def load_state(worlds_root, stream):
+    p = state_path(worlds_root, stream)
+    try:
+        return json.loads(p.read_text()) if p.exists() else {}
+    except Exception:
+        return {}
+
+
+def save_state(worlds_root, stream, **fields):
+    p = state_path(worlds_root, stream)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    st = load_state(worlds_root, stream)
+    st.update(fields, updated=time.strftime("%Y-%m-%d %H:%M:%S"))
+    tmp = p.with_name(p.name + ".tmp")          # atomic replace: a crash mid-write can't zero it
+    tmp.write_text(json.dumps(st, indent=2))
+    tmp.replace(p)
+
+
+def append_history(worlds_root, stream, entry):
+    p = history_path(worlds_root, stream)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def reset_counts(worlds_root, stream):
+    """--fresh: start this stream's numbering over. The world itself is untouched; the old history
+    is kept beside the new one, not deleted."""
+    save_state(worlds_root, stream, activations=0)
+    h = history_path(worlds_root, stream)
+    if h.exists():
+        h.rename(h.with_name(f"history-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
 
 
 def _run(args, timeout=120):

@@ -217,6 +217,9 @@ the final content, so thinking never trips them.
 - `runs/<run>/<stream>/` — `activations.jsonl`, `transcripts/`, `record-history/`,
   `interviews/`, `world-snapshots/`
 - `worlds*/<stream>/home/` — each stream's persistent world (bind-mounted home)
+- `worlds*/<stream>/state.json`, `history.jsonl`, `WITHDRAWN` — the stream's lifetime
+  activation count, its compact per-activation history, and its retirement marker. These
+  sit *beside* `home/`, outside the container, so the model can't see or edit them.
 
 The host broker is the only thing that talks to Ollama; the container just runs shell
 commands relayed via `docker exec` and holds no secrets.
@@ -251,6 +254,14 @@ your inference box, and either `./run.sh --config config-long.yaml` in a tmux, o
 per-model cadence gap, unbounded, into a separate `worlds-long/`.
 
 - **Stop cleanly:** `touch runs/<run>/STOP` (path printed at startup) or Ctrl-C.
+- **Restarts resume.** A stream's activation count is persisted in its world after every
+  activation, so a relaunch (crash, reboot, `Restart=on-failure`) continues numbering,
+  the interview cadence and the interview's "you have been through N activations" where
+  it left off, and the interview digest spans restarts. Each launch still gets its own
+  `runs/<run>/` directory. `--fresh` starts every stream's count at 0 again (worlds and
+  records untouched; old history rotated, not deleted). Note this means a second
+  `./run.sh` shakedown on the same worlds does nothing once the cap is reached — that's
+  what `--fresh` is for.
 - **Full teardown:** `bash teardown.sh` — removes containers, network, firewall;
   keeps `worlds*/` and `runs/`.
 
@@ -289,6 +300,9 @@ Artifacts of the harness that are easy to misread as model behavior:
   Before this, only the long-run time-share pool retired a stream; the shakedown batch
   loop kept reactivating a stream that had withdrawn until its activation cap, and
   neither it nor `--once` wrote the on-disk marker. Found in outside review.
+  Also: activation counts now persist per stream (`state.json`), so a restart resumes
+  instead of silently starting every stream at activation 1 — which had been resetting
+  the interview cadence on every relaunch.
 
 Changes to the substrate are deliberate, versioned deltas against the previous version,
 never silent edits to a running baseline, so runs stay comparable.

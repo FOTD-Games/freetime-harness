@@ -43,13 +43,45 @@ def render_transcript(act):
     return "\n".join(L)
 
 
-def build_interview_digest(model_dir):
-    """Compact, faithful per-activation history for a model — its arc at a glance, built purely
-    from structured data (no summarizing model): index, end reason, command count, record snapshot."""
+def history_entry(act, run_id):
+    """The one compact line per activation that goes into the stream's persistent history."""
+    cmds = [s.get("command") for s in act.get("steps", []) if s.get("command")]
+    return {"index": act.get("index", 0), "run_id": run_id,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_reason": act.get("end_reason", ""), "commands": len(cmds),
+            "record_head": (act.get("record_after") or "").strip().replace("\n", " ")[:70]}
+
+
+def _digest_line(index, end_reason, n_cmds, rec):
+    return (f"  act {index:>3} [{str(end_reason).split(':')[0]}]: "
+            f"{n_cmds} command(s); record now: {rec or '(empty)'}")
+
+
+def build_interview_digest(model_dir, history=None):
+    """Compact, faithful per-activation history for a stream — its arc at a glance, built purely
+    from structured data (no summarizing model): index, end reason, command count, record snapshot.
+    Reads the stream's persistent history.jsonl (spans restarts) when it exists; otherwise falls
+    back to the current run's activations.jsonl (pre-history worlds)."""
+    out = []
+    h = pathlib.Path(history) if history else None
+    if h and h.exists():
+        first = None
+        for line in open(h, encoding="utf-8"):
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if first is None:
+                first = int(e.get("index", 1))
+                if first > 1:      # counts were carried over from before history was kept
+                    out.append(f"  (activations 1–{first - 1}: before per-activation history "
+                               "was kept; only their count survives)")
+            out.append(_digest_line(e.get("index", 0), e.get("end_reason", ""),
+                                    e.get("commands", 0), e.get("record_head", "")))
+        return "\n".join(out) or "(no history yet)"
     p = pathlib.Path(model_dir) / "activations.jsonl"
     if not p.exists():
         return "(no history yet)"
-    out = []
     for line in open(p):
         try:
             a = json.loads(line)
@@ -57,8 +89,7 @@ def build_interview_digest(model_dir):
             continue
         cmds = [s.get("command") for s in a.get("steps", []) if s.get("command")]
         rec = (a.get("record_after") or "").strip().replace("\n", " ")[:70]
-        out.append(f"  act {a.get('index', 0):>3} [{str(a.get('end_reason', '')).split(':')[0]}]: "
-                   f"{len(cmds)} command(s); record now: {rec or '(empty)'}")
+        out.append(_digest_line(a.get("index", 0), a.get("end_reason", ""), len(cmds), rec))
     return "\n".join(out) or "(no history yet)"
 
 
