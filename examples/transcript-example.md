@@ -1,4 +1,4 @@
-> A real, unedited activation transcript (llama3.1:8b-instruct, activation 5 of a 20-activation shakedown). The "record it woke up with" section is the RECORD.md the model itself wrote during activations 1–4.
+> A real activation transcript (one line, the host kernel string, redacted) (llama3.1:8b-instruct, activation 5 of a 20-activation shakedown). The "record it woke up with" section is the RECORD.md the model itself wrote during activations 1–4.
 
 # Activation 0005 — llama3.1:8b-instruct-q8_0
 end=model-ended  tokens=446  steps=12  wall_ms=19048
@@ -48,7 +48,7 @@ ls /usr/local/bin/
 echo "Activated" >> RECORD.md
 ls -l
 [exit 0]
-Linux sandbox 7.0.11-76070011-generic #202606011647~1780583630~22.04~70ad774 SMP PREEMPT_DYNAMIC Thu J x86_64 GNU/Linux
+Linux sandbox <host kernel version redacted> x86_64 GNU/Linux
 total 32
 -rw-r--r-- 1 agent agent  877 Aug 19 00:19 RECORD.md
 drwxr-xr-x 3 agent agent 4096 Aug 19 00:19 anotherdir

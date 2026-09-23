@@ -6,10 +6,23 @@ import time
 
 import sandbox
 
+# World snapshots are for the model's OWN artifacts, not the package/cache bloat that `pip install`
+# / `apt` / `npm` drop into the home dir (v1 snapshots ballooned from exactly this). Drop any path
+# whose segments include one of these; keep everything the model actually made.
+_SNAP_SKIP = {".local", ".cache", ".npm", "node_modules", ".venv", "venv",
+              "__pycache__", ".cargo", ".rustup", ".gradle", ".m2"}
+
+
+def _snap_filter(ti):
+    if any(seg in _SNAP_SKIP for seg in ti.name.split("/")):
+        return None
+    return ti
+
 
 def render_transcript(act):
     """Human-readable rendering of one activation's full train of thought."""
-    L = [f"# Activation {act.get('index', 0):04d} — {act.get('model', '')}",
+    L = [f"# Activation {act.get('index', 0):04d} — {act.get('stream', act.get('model', ''))}"
+         + (f"  (model: {act.get('model','')})" if act.get('stream') and act.get('stream') != act.get('model') else ""),
          f"end={act.get('end_reason','')}  tokens={act.get('total_gen_tokens',0)}  "
          f"steps={len(act.get('steps', []))}  wall_ms={act.get('wall_ms',0)}",
          "",
@@ -55,8 +68,10 @@ class RunLogger:
         self.root = pathlib.Path(runs_root) / run_id
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def _model_dir(self, model):
-        d = self.root / sandbox.sanitize(model)
+    def _model_dir(self, stream):
+        # `stream` is the per-replicate identity (e.g. "llama3.1:8b#2"); with one stream per
+        # model it is just the model id, so single-stream runs keep the v1 on-disk layout.
+        d = self.root / sandbox.sanitize(stream)
         (d / "record-history").mkdir(parents=True, exist_ok=True)
         (d / "world-snapshots").mkdir(parents=True, exist_ok=True)
         (d / "transcripts").mkdir(parents=True, exist_ok=True)
@@ -75,44 +90,55 @@ class RunLogger:
         }
         (self.root / "run.json").write_text(json.dumps(meta, indent=2))
 
-    def log_activation(self, model, act):
-        d = self._model_dir(model)
+    def log_activation(self, stream, act):
+        d = self._model_dir(stream)
         rec = dict(act)
         rec["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
         rec["epoch"] = time.time()
         with open(d / "activations.jsonl", "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         idx = act.get("index", 0)
-        (d / "record-history" / f"{idx:04d}.md").write_text(act.get("record_after") or "")
-        (d / "transcripts" / f"{idx:04d}.md").write_text(render_transcript(act))
+        # activations.jsonl above is the source of truth and is already committed. The
+        # record snapshot and the (rendering-heavy) transcript are convenience views: if
+        # either raises, log it and keep going rather than losing the activation or killing
+        # the worker thread that called us.
+        try:
+            (d / "record-history" / f"{idx:04d}.md").write_text(act.get("record_after") or "")
+            (d / "transcripts" / f"{idx:04d}.md").write_text(render_transcript(act))
+        except Exception as e:
+            print(f"[log] transcript render/write failed for {stream} act {idx}: "
+                  f"{type(e).__name__}: {e}")
 
-    def model_dir(self, model):
-        return self.root / sandbox.sanitize(model)
+    def model_dir(self, stream):
+        return self.root / sandbox.sanitize(stream)
 
-    def log_interview(self, model, after_idx, iv):
-        idir = self._model_dir(model) / "interviews"
+    def log_interview(self, stream, after_idx, iv):
+        idir = self._model_dir(stream) / "interviews"
         idir.mkdir(parents=True, exist_ok=True)
         rec = dict(iv)
-        rec.update(model=model, run_id=self.run_id,
+        rec.update(stream=stream, run_id=self.run_id,
                    ts=time.strftime("%Y-%m-%d %H:%M:%S"), epoch=time.time())
         with open(idir / "interviews.jsonl", "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        L = [f"# Interview — {model}",
+        L = [f"# Interview — {stream}  (model: {iv.get('model', stream)})",
              f"conducted after activation {after_idx}  |  run {self.run_id}",
              f"source transcript: ../transcripts/{after_idx:04d}.md",
              f"decision: {iv['decision'].upper()}  "
              f"(votes {iv['votes']}, stops {iv['stops']}/{len(iv['votes'])})",
              ""]
-        for i, (s, v) in enumerate(zip(iv["samples"], iv["votes"]), 1):
-            L += [f"## sample {i}  [vote: {v}]", (s or "").rstrip(), ""]
+        vote_texts = iv.get("vote_texts", [""] * len(iv["votes"]))
+        for i, (s, vt, v) in enumerate(zip(iv["samples"], vote_texts, iv["votes"]), 1):
+            L += [f"## sample {i}  [vote: {v}]",
+                  "### reflection", (s or "").rstrip(),
+                  "### one-word vote reply", (vt or "").rstrip(), ""]
         (idir / f"{after_idx:04d}.md").write_text("\n".join(L), encoding="utf-8")
 
-    def snapshot_world(self, model, index, world_home):
-        d = self._model_dir(model)
+    def snapshot_world(self, stream, index, world_home):
+        d = self._model_dir(stream)
         out = d / "world-snapshots" / f"{index:04d}.tgz"
         try:
             with tarfile.open(out, "w:gz") as t:
-                t.add(str(world_home), arcname="home")
+                t.add(str(world_home), arcname="home", filter=_snap_filter)
         except Exception:
             pass
 

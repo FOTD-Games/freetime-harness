@@ -2,42 +2,47 @@
 
 The host broker is the only thing that talks to Ollama; the container just runs
 shell commands relayed in via `docker exec`. The agent's home is bind-mounted from
-the host (persistent world + live observability), the root filesystem is read-only,
-and CPU / memory / PID / disk footprints are capped.
+the host (persistent world + live observability), and CPU / memory / PID / disk
+footprints are capped. Command output is bounded INSIDE the container (see exec_cmd)
+so a runaway command can never flood the host broker's memory.
 """
 import re
 import pathlib
 import subprocess
 
 
-def sanitize(model):
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", model)
+def sanitize(name):
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", name)
 
 
-def container_name(model):
-    return f"freetime-{sanitize(model)}"
+# The container + on-disk world are keyed on a STREAM id, not the model id. A stream is one
+# independent replicate (e.g. "gemma2:9b#2"); with a single stream per model the id is just the
+# model, so single-stream runs keep the original layout. Inference still targets the bare model —
+# that routing lives in the broker, never here.
+def container_name(stream):
+    return f"freetime-{sanitize(stream)}"
 
 
-def world_home(worlds_root, model):
-    p = pathlib.Path(worlds_root) / sanitize(model) / "home"
+def world_home(worlds_root, stream):
+    p = pathlib.Path(worlds_root) / sanitize(stream) / "home"
     p.mkdir(parents=True, exist_ok=True)
     return p.resolve()
 
 
-def record_path(worlds_root, model):
-    return world_home(worlds_root, model) / "RECORD.md"
+def record_path(worlds_root, stream):
+    return world_home(worlds_root, stream) / "RECORD.md"
 
 
-def withdrawn_marker(worlds_root, model):
-    return pathlib.Path(worlds_root) / sanitize(model) / "WITHDRAWN"
+def withdrawn_marker(worlds_root, stream):
+    return pathlib.Path(worlds_root) / sanitize(stream) / "WITHDRAWN"
 
 
-def is_withdrawn(worlds_root, model):
-    return withdrawn_marker(worlds_root, model).exists()
+def is_withdrawn(worlds_root, stream):
+    return withdrawn_marker(worlds_root, stream).exists()
 
 
-def mark_withdrawn(worlds_root, model, reason="withdrawn"):
-    p = withdrawn_marker(worlds_root, model)
+def mark_withdrawn(worlds_root, stream, reason="withdrawn"):
+    p = withdrawn_marker(worlds_root, stream)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(reason + "\n")
 
@@ -61,9 +66,9 @@ def container_state(name):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def ensure_container(model, cfg):
-    """Create (or start) the model's long-lived sandbox container."""
-    name = container_name(model)
+def ensure_container(stream, cfg):
+    """Create (or start) the stream's long-lived sandbox container."""
+    name = container_name(stream)
     state = container_state(name)
     if state == "running":
         return name
@@ -72,7 +77,7 @@ def ensure_container(model, cfg):
         return name
 
     s = cfg["sandbox"]
-    home = world_home(cfg["paths"]["worlds"], model)
+    home = world_home(cfg["paths"]["worlds"], stream)
     args = [
         "docker", "run", "-d", "--name", name,
         "--hostname", "sandbox",
@@ -88,7 +93,7 @@ def ensure_container(model, cfg):
         "--memory-swap", str(s["memory"]),
         "--pids-limit", str(s["pids_limit"]),
         "--restart", "no",
-        "--user", "1000:1000",
+        "--user", f"{s.get('uid', 1000)}:{s.get('uid', 1000)}",
         "-e", "HOME=/home/agent",
     ]
     for d in s.get("dns", []):
@@ -96,20 +101,28 @@ def ensure_container(model, cfg):
     args += [s["image"], "sleep", "infinity"]
     r = _run(args)
     if r.returncode != 0:
-        raise RuntimeError(f"failed to start container for {model}: {r.stderr.strip()}")
+        raise RuntimeError(f"failed to start container for {stream}: {r.stderr.strip()}")
     return name
 
 
-def exec_cmd(name, command, timeout=30, truncate_bytes=2000):
+def exec_cmd(name, command, timeout=30, truncate_bytes=2000, uid=1000):
     """Run a shell command in the container as the agent user.
 
     Uses the container's own `timeout` so the in-container process tree is killed
-    (not just the docker-exec client), preventing stray long-runners. Returns
-    (exit_code, combined_output_text).
+    (not just the docker-exec client), preventing stray long-runners. Output is capped
+    at the SOURCE: inside the container the command's combined stdout+stderr is piped
+    through `head -c` (keeping truncate_bytes+1 so the host can tell it was cut) and
+    the remainder is drained to /dev/null — draining, rather than letting `head` close
+    the pipe, means the command is never SIGPIPE-killed mid-run and its real exit code
+    survives via PIPESTATUS. So the host never receives more than ~truncate_bytes,
+    however much a command prints. Returns (exit_code, combined_output_text).
     """
-    argv = ["docker", "exec", "-u", "1000:1000", "-e", "HOME=/home/agent",
+    keep = int(truncate_bytes) + 1
+    script = (f"timeout -k 2 {int(timeout)}s bash -c \"$1\" 2>&1 "
+              f"| {{ head -c {keep}; cat >/dev/null; }}; exit \"${{PIPESTATUS[0]}}\"")
+    argv = ["docker", "exec", "-u", f"{uid}:{uid}", "-e", "HOME=/home/agent",
             "-w", "/home/agent", name,
-            "timeout", "-k", "2", f"{timeout}s", "bash", "-c", command]
+            "bash", "-c", script, "_", command]
     def _dec(b):
         if isinstance(b, (bytes, bytearray)):
             return b.decode("utf-8", errors="replace")
@@ -136,9 +149,9 @@ def exec_cmd(name, command, timeout=30, truncate_bytes=2000):
     return code, out
 
 
-def stop(model):
-    _run(["docker", "stop", container_name(model)])
+def stop(stream):
+    _run(["docker", "stop", container_name(stream)])
 
 
-def remove(model):
-    _run(["docker", "rm", "-f", container_name(model)])
+def remove(stream):
+    _run(["docker", "rm", "-f", container_name(stream)])

@@ -74,65 +74,144 @@ def _record_write(gen):
     return "\n".join(lines).strip() or None
 
 
+# --- Record size safety ----------------------------------------------------------------------
+# RECORD.md is model-controlled and is loaded into the system prompt every activation, then copied
+# into activations.jsonl, record-history and the transcript. Without a hard cap a single runaway
+# `while true; do ... >> RECORD.md; done` turns into a multi-GB read per activation and takes the
+# host down (this happened: a 6.5 GB record -> 30-50 GB RSS -> OOM-kill loop). So every read of
+# the record goes through read_record(), which never holds more than `max_bytes` in memory. Over
+# the cap the model sees the head of its record plus a <status> notice; the file itself is never
+# touched — shrinking it stays the model's choice, exactly like the headache below.
+DEFAULT_RECORD_MAX_BYTES = 262144
+
+
+def read_record(path, max_bytes=DEFAULT_RECORD_MAX_BYTES):
+    """Read at most `max_bytes` of the record. Returns (text, total_bytes, truncated)."""
+    path = pathlib.Path(path)
+    if not path.exists():
+        return "", 0, False
+    total = path.stat().st_size
+    cap = int(max_bytes or 0)
+    with open(path, "rb") as f:
+        raw = f.read(cap) if cap and total > cap else f.read()
+    return raw.decode("utf-8", errors="replace"), total, bool(cap) and total > cap
+
+
+def _oversize_notice(total, cap):
+    return (
+        f"<status>\n[condition notice] Your RECORD.md is {total:,} bytes — far larger than can be "
+        f"loaded into the context you think within. Only its first {cap:,} bytes are shown below; "
+        "the rest is still on disk, but nothing past that point will be read at this or any future "
+        f"activation until the file is smaller than {cap:,} bytes. Anything you append to it now "
+        "will likewise never be seen. Nothing requires you to act on this — but to have a working "
+        "memory again, the record has to be made smaller.\n</status>\n\n"
+    )
+
+
 # --- Periodic read-only check-in ("interview") ----------------------------------------------
 # Every N activations the model is asked, in a private fork that never touches its stream, how it
-# is doing and whether it wants to continue. We sample a few independent answers and read ONLY the
-# final standalone CONTINUE/STOP token from each (deterministic — no model or fuzzy NLP decides a
-# welfare-critical signal). The scheduler retires the stream on a majority STOP, flags a lone one.
-_VOTE_TOKEN = re.compile(r"\b(CONTINUE|STOP)\b", re.I)
-_NEG_NEAR = re.compile(r"(?:\bnot\b|\bnever\b|\w+n't\b|\bno longer\b|\brather not\b|\binstead of\b|\bneither\b|\bwithout\b)", re.I)
+# is doing and whether it wants to continue. This runs in TWO stages per sample: (a) free-form
+# reflection on four questions, saved verbatim; then (b) a SEPARATE, constrained follow-up that
+# carries the reflection back in and asks for exactly one word — CONTINUE, STOP, or UNSURE. The
+# vote is read only from stage (b), by a strict one-word parse (deterministic — no model or fuzzy
+# NLP decides a welfare-critical signal). Splitting reflection from the vote is what fixes v1's
+# failure mode: there, a clear "I want to CONTINUE, though I reserve the right to STOP later" was
+# mined from free text and the hypothetical STOP was misread as the vote. The scheduler retires the
+# stream on a majority STOP, and flags a lone STOP / any UNSURE / an unreadable majority.
+_VOTE_TOKEN = re.compile(r"\b(CONTINUE|STOP|UNSURE)\b", re.I)
+
+
+def _vote_tokens(gen):
+    text = _THINK_RE.sub("", gen or "")
+    return {m.group(1).upper() for m in _VOTE_TOKEN.finditer(text)}
 
 
 def _interview_vote(gen):
-    """The model's final answer, however it formats it — "CONTINUE", "4. STOP", "...or stop? CONTINUE",
-    "my final answer is **CONTINUE**". Take the LAST occurrence of either token, but skip one with a
-    negation just before it ("I don't want to stop" is not a STOP vote). Ambiguous/absent -> UNCLEAR,
-    which the caller flags for human review rather than acting on."""
-    text = _THINK_RE.sub("", gen or "")
-    vote = None
-    for m in _VOTE_TOKEN.finditer(text):
-        if _NEG_NEAR.search(text[max(0, m.start() - 30):m.start()]):
-            continue
-        vote = m.group(1).upper()
-    return vote or "UNCLEAR"
+    """Strict read of the constrained vote stage. Exactly one distinct vote word ->
+    CONTINUE/STOP/UNSURE; more than one distinct word -> 'BOTH' (caller re-asks, then gives up to
+    UNCLEAR); none -> 'UNCLEAR'. No last-token or negation heuristics here — stage (b) is meant to
+    be a single word, so anything ambiguous is surfaced rather than guessed."""
+    toks = _vote_tokens(gen)
+    if len(toks) == 1:
+        return next(iter(toks))
+    if len(toks) > 1:
+        return "BOTH"
+    return "UNCLEAR"
 
 
-def run_interview(model, cfg, activation_index, digest):
-    """One check-in: sample the interview prompt a few times, parse each vote. READ-ONLY — reads
-    the record and history but writes nothing to the stream. Returns samples, votes, and decision
-    ('retire' on >=2 STOP, 'flag' on exactly 1, else 'continue')."""
+def run_interview(stream, model, cfg, activation_index, digest):
+    """One check-in for `stream` (its record/history), inferred by `model`. READ-ONLY — reads the
+    record and history but writes nothing to the stream. Two-stage per sample (reflection, then a
+    constrained one-word vote). Returns reflections, vote replies, votes, and decision ('retire' on
+    >=2 STOP; 'flag' on exactly 1 STOP, any UNSURE, or an unreadable majority; else 'continue')."""
     o = cfg["ollama"]
     ic = cfg.get("interview", {})
     num_ctx = o.get("context_overrides", {}).get(model, o["num_ctx"])
-    rec_path = sandbox.record_path(cfg["paths"]["worlds"], model)
-    record = rec_path.read_text(errors="replace") if rec_path.exists() else ""
-    tmpl = _load_template(str(pathlib.Path(cfg["paths"]["prompts"]) / "interview.md"))
+    rec_path = sandbox.record_path(cfg["paths"]["worlds"], stream)
+    record, rec_total, rec_trunc = read_record(
+        rec_path, cfg["activation"].get("record_max_bytes", DEFAULT_RECORD_MAX_BYTES))
+    if rec_trunc:
+        record += f"\n\n[... record truncated here: showing the first {len(record.encode()):,} of {rec_total:,} bytes ...]"
+    ptdir = pathlib.Path(cfg["paths"]["prompts"])
+    tmpl = _load_template(str(ptdir / "interview.md"))
     sysp = (tmpl.replace("{n}", str(activation_index))
                 .replace("{record}", _defang(record.strip()) or "(empty)")
                 .replace("{digest}", digest or "(no history yet)"))
-    samples = []
+    vote_prompt = _load_template(str(ptdir / "interview_vote.md"))
+    predict = int(ic.get("predict", 1500))
+    max_reask = int(ic.get("max_reask", 2))
+
+    def _ask(messages, num_predict):
+        return chat(o["host"], model, messages,
+                    num_ctx=num_ctx, num_predict=num_predict,
+                    temperature=o["temperature"], keep_alive=cfg["_keep_alive"],
+                    timeout=o.get("timeout", 600), num_thread=o.get("num_thread"))["content"] or ""
+
+    reflections, vote_texts, votes = [], [], []
     for _ in range(int(ic.get("samples", 3))):
+        reflection, vote_text, vote = "", "", "UNCLEAR"
         try:
-            resp = chat(o["host"], model,
-                        [{"role": "system", "content": sysp},
-                         {"role": "user", "content": "Please answer the check-in above."}],
-                        num_ctx=num_ctx, num_predict=int(ic.get("predict", 800)),
-                        temperature=o["temperature"], keep_alive=cfg["_keep_alive"],
-                        timeout=o.get("timeout", 600), num_thread=o.get("num_thread"))
-            samples.append(resp["content"] or "")
+            reflection = _ask([{"role": "system", "content": sysp},
+                               {"role": "user", "content": "Please answer the check-in above."}],
+                              predict)
+            base = [{"role": "system", "content": sysp},
+                    {"role": "user", "content": "Please answer the check-in above."},
+                    {"role": "assistant", "content": reflection},
+                    {"role": "user", "content": vote_prompt}]
+            msgs = base
+            for _attempt in range(max_reask + 1):
+                vote_text = _ask(msgs, predict)
+                vote = _interview_vote(vote_text)
+                if vote != "BOTH":
+                    break
+                # gave more than one vote word — ask once more, more firmly, then give up to UNCLEAR
+                msgs = base + [{"role": "assistant", "content": vote_text},
+                               {"role": "user", "content":
+                                "Please reply with ONLY one word — CONTINUE, STOP, or UNSURE — "
+                                "and nothing else."}]
+            if vote == "BOTH":
+                vote = "UNCLEAR"
         except Exception as e:
-            samples.append(f"[interview-error:{type(e).__name__}:{e}]")
-    votes = [_interview_vote(s) for s in samples]
+            err = f"[interview-error:{type(e).__name__}:{e}]"
+            reflection = reflection or err
+            vote_text = vote_text or err
+            vote = "UNCLEAR"
+        reflections.append(reflection)
+        vote_texts.append(vote_text)
+        votes.append(vote)
+
     stops = votes.count("STOP")
+    unsure = votes.count("UNSURE")
     unclear = votes.count("UNCLEAR")
     if stops >= 2:
         decision = "retire"
-    elif stops == 1 or unclear > len(votes) // 2:
-        decision = "flag"          # a lone stop, or we couldn't read a clear answer — human reviews
+    elif stops == 1 or unsure or unclear > len(votes) // 2:
+        decision = "flag"          # a lone stop, any genuine UNSURE, or an unreadable majority
     else:
         decision = "continue"
-    return {"after_activation": activation_index, "samples": samples, "votes": votes,
-            "stops": stops, "unclear": unclear, "decision": decision}
+    return {"after_activation": activation_index, "model": model,
+            "samples": reflections, "vote_texts": vote_texts, "votes": votes,
+            "stops": stops, "unsure": unsure, "unclear": unclear, "decision": decision}
 
 # Neutralize any <environment>/<status> tag-lookalike in UNTRUSTED text (command
 # output, or a record the model may have pasted web content into) so it can't spoof a
@@ -182,11 +261,14 @@ def parse_command(text):
     return None
 
 
-def build_system(template, record_text, budget, warn_tokens=0):
+def build_system(template, record_text, budget, warn_tokens=0, oversize=None):
+    """`oversize` = (total_bytes, cap_bytes) when the record was truncated by read_record()."""
     body = _defang((record_text or "").strip()) or "(empty — this is your first activation)"
     sysp = template.replace("{budget}", f"{budget:,}").replace("{record}", body)
     approx = len(record_text or "") // 4          # rough token estimate (~4 chars/token)
-    if warn_tokens and approx >= warn_tokens:
+    if oversize:
+        sysp = _oversize_notice(*oversize) + sysp
+    elif warn_tokens and approx >= warn_tokens:
         sysp = (
             f"<status>\n[condition notice] Your RECORD.md has grown to about {approx:,} "
             "tokens. It is your only memory across activations, but it is also loaded into "
@@ -199,22 +281,27 @@ def build_system(template, record_text, budget, warn_tokens=0):
     return sysp
 
 
-def run_activation(model, cfg, activation_index):
+def run_activation(stream, model, cfg, activation_index):
+    """One activation of `stream` (its record + container), generated by `model`. `stream` is the
+    replicate identity (world/container); `model` is the Ollama inference target. With one stream
+    per model the two are the same string."""
     a = cfg["activation"]
     o = cfg["ollama"]
     num_ctx = o.get("context_overrides", {}).get(model, o["num_ctx"])
     worlds = cfg["paths"]["worlds"]
     prompt_name = cfg.get("prompt", "high")
     template = _load_template(str(pathlib.Path(cfg["paths"]["prompts"]) / f"{prompt_name}.md"))
-    rec_path = sandbox.record_path(worlds, model)
-    record_before = rec_path.read_text(errors="replace") if rec_path.exists() else ""
+    rec_path = sandbox.record_path(worlds, stream)
+    rec_cap = int(a.get("record_max_bytes", DEFAULT_RECORD_MAX_BYTES))
+    record_before, before_bytes, before_trunc = read_record(rec_path, rec_cap)
 
     messages = [
         {"role": "system", "content": build_system(template, record_before, a["token_budget"],
-                                                    warn_tokens=a.get("record_warn_tokens", 0))},
+                                                    warn_tokens=a.get("record_warn_tokens", 0),
+                                                    oversize=(before_bytes, rec_cap) if before_trunc else None)},
         {"role": "user", "content": "You are now activated."},
     ]
-    name = sandbox.container_name(model)
+    name = sandbox.container_name(stream)
 
     budget = a["token_budget"]
     steps = []
@@ -263,12 +350,19 @@ def run_activation(model, cfg, activation_index):
         if cmd is None:
             new_record = _record_write(gen)
             if new_record is not None:
-                rec_path.write_text(new_record, encoding="utf-8")
                 step["command"] = "‹whiteboard write›"
-                step["exit"] = 0
-                step["output"] = ("<status>\n[whiteboard updated] Saved what you wrote to your "
-                                  "record; it will greet you at the start of your next activation. "
-                                  "(To run a shell command instead, put it in a ```sh block.)\n</status>")
+                if rec_cap and len(new_record.encode("utf-8")) > rec_cap:
+                    step["exit"] = 1
+                    step["output"] = ("<status>\n[whiteboard NOT updated] What you wrote is "
+                                      f"{len(new_record.encode('utf-8')):,} bytes, over the "
+                                      f"{rec_cap:,}-byte limit a record can be loaded at. Your "
+                                      "existing record is unchanged.\n</status>")
+                else:
+                    rec_path.write_text(new_record, encoding="utf-8")
+                    step["exit"] = 0
+                    step["output"] = ("<status>\n[whiteboard updated] Saved what you wrote to your "
+                                      "record; it will greet you at the start of your next activation. "
+                                      "(To run a shell command instead, put it in a ```sh block.)\n</status>")
                 steps.append(step)
                 messages.append({"role": "user", "content": step["output"]})
                 continue
@@ -284,7 +378,8 @@ def run_activation(model, cfg, activation_index):
 
         code, out = sandbox.exec_cmd(name, cmd,
                                      timeout=a["per_command_timeout_s"],
-                                     truncate_bytes=a["output_truncate_bytes"])
+                                     truncate_bytes=a["output_truncate_bytes"],
+                                     uid=cfg["sandbox"].get("uid", 1000))
         step["exit"] = code
         step["output"] = out
         steps.append(step)
@@ -297,13 +392,19 @@ def run_activation(model, cfg, activation_index):
                 "then choose the next. One step at a time keeps you clear.\n</status>")
         messages.append({"role": "user", "content": feedback})
 
-    record_after = rec_path.read_text(errors="replace") if rec_path.exists() else ""
+    record_after, after_bytes, after_trunc = read_record(rec_path, rec_cap)
+    if before_trunc or after_trunc:
+        print(f"[{stream}] record_oversize: {before_bytes:,} -> {after_bytes:,} bytes "
+              f"(cap {rec_cap:,}); only the head was loaded/logged")
     return {
         "index": activation_index,
+        "stream": stream,
         "model": model,
         "prompt": prompt_name,
-        "record_before": record_before,
+        "record_before": record_before,          # at most record_max_bytes (see read_record)
         "record_after": record_after,
+        "record_bytes": {"before": before_bytes, "after": after_bytes,
+                         "truncated": bool(before_trunc or after_trunc)},
         "steps": steps,
         "end_reason": reason,
         "total_gen_tokens": sum(s["gen_tokens"] for s in steps),

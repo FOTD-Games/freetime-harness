@@ -24,7 +24,7 @@ def main():
     any_iv = False
     for p in sorted(glob.glob(f"{run}/*/interviews/interviews.jsonl")):
         any_iv = True
-        model = p.split("/")[-3]
+        stream = p.split("/")[-3]
         per = {"continue": 0, "flag": 0, "retire": 0}
         for line in open(p):
             try:
@@ -35,22 +35,26 @@ def main():
             per[d] = per.get(d, 0) + 1
             tot[d] = tot.get(d, 0) + 1
             if d == "retire":
-                retired.append((model, iv))
+                retired.append((stream, iv))
             elif d == "flag":
-                flagged.append((model, iv))
-        print(f"  {model:40s} continue={per['continue']} flag={per['flag']} retire={per['retire']}")
+                flagged.append((stream, iv))
+        print(f"  {stream:40s} continue={per['continue']} flag={per['flag']} retire={per['retire']}")
     if not any_iv:
         print("  (no interviews recorded yet)"); return
     print(f"  {'TOTAL':40s} continue={tot['continue']} flag={tot['flag']} retire={tot['retire']}")
     for label, items in [("RETIRED — stop honored", retired),
-                         ("FLAGGED — 1/3 said stop, needs your review", flagged)]:
+                         ("FLAGGED — 1 STOP / any UNSURE / unreadable, needs your review", flagged)]:
         if items:
             print(f"\n=== {label} ===")
-            for model, iv in items:
-                print(f"  [{model}] after act {iv.get('after_activation')} — votes {iv.get('votes')}")
-                for i, (s, v) in enumerate(zip(iv.get("samples", []), iv.get("votes", [])), 1):
+            for stream, iv in items:
+                print(f"  [{stream}] after act {iv.get('after_activation')} — votes {iv.get('votes')}")
+                vts = iv.get("vote_texts", [""] * len(iv.get("votes", [])))
+                for i, (s, vt, v) in enumerate(zip(iv.get("samples", []), vts, iv.get("votes", [])), 1):
                     snippet = (s or "").strip().replace("\n", " ")[:200]
+                    reply = (vt or "").strip().replace("\n", " ")[:60]
                     print(f"      sample{i}[{v}]: {snippet}")
+                    if reply:
+                        print(f"               vote reply: {reply}")
 
 
 if __name__ == "__main__":

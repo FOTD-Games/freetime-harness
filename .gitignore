@@ -8,3 +8,7 @@ __pycache__/
 *.log
 .venv/
 venv/
+.cache/
+.env
+*.jsonl
+.pytest_cache/

@@ -25,11 +25,13 @@ activation:
   output_truncate_bytes: 2000
   context_guard_frac: 0.85   # stop the activation if the prompt fills this much of num_ctx
   record_warn_tokens: 2000   # in-prompt "headache" once RECORD.md exceeds ~this many tokens (0 = off; see Homeostatic drives)
+  record_max_bytes: 262144      # HARD cap on how much of RECORD.md is ever loaded (memory safety; see README "Record size"). record_warn_tokens above is the soft, in-prompt signal.
 
-interview:                   # periodic read-only welfare check-in (see README); off for a shakedown
+interview:                   # periodic read-only welfare check-in, two-stage (see README); off for a shakedown
   every: 0                   # run one after every N activations (0 = off; try 10 on long runs)
-  samples: 3                 # independent forks; >=2 STOP retires the stream, 1-or-unreadable flags it
-  predict: 1500
+  samples: 3         # independent forks per check-in; >=2 STOP retires the stream, 1 STOP / any UNSURE / unreadable flags it
+  predict: 1500      # token cap per stage (free reflection, then the separate one-word vote)
+  max_reask: 2       # if the one-word vote reply contains >1 vote word, re-ask this many times, then UNCLEAR (flag)
 
 sandbox:
   image: freetime-sandbox:latest
@@ -40,6 +42,7 @@ sandbox:
   pids_limit: 256
   tmp_size: 256m
   dns: ["1.1.1.1", "8.8.8.8"]
+  uid: 1000                  # host uid the agent runs as (must match the image's --build-arg UID so the bind-mounted home is writable)
 
 schedule:
   shakedown:
@@ -53,6 +56,8 @@ schedule:
     keep_alive: "10m"
     batch_by_model: false
     concurrency: 1           # models activated at once per wave
+
+streams_per_model: 1         # independent replicates per model (stream id "<model>#k": own world/container/logs; inference targets the bare model). 1 = classic layout.
 
 paths:
   prompts: prompts

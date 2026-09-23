@@ -57,58 +57,73 @@ def main():
     else:
         models = list(cfg["models"])
 
-    withdrawn = [m for m in models if sandbox.is_withdrawn(cfg["paths"]["worlds"], m)]
+    # Horizontal scaling: each model is run as N independent streams (replicates). A stream id is
+    # "<model>#<k>" for k=1..N — the world/container/log identity — while inference still targets the
+    # bare model. With streams_per_model == 1 the stream id IS the model, so the layout is unchanged.
+    n_streams = max(1, int(cfg.get("streams_per_model", 1)))
+    streams = []                 # ordered list of stream ids
+    stream_model = {}            # stream id -> inference model
+    for m in models:
+        for k in range(1, n_streams + 1):
+            sid = m if n_streams == 1 else f"{m}#{k}"
+            streams.append(sid)
+            stream_model[sid] = m
+
+    withdrawn = [s for s in streams if sandbox.is_withdrawn(cfg["paths"]["worlds"], s)]
     if withdrawn:
-        print(f"skipping {len(withdrawn)} withdrawn model(s): {', '.join(withdrawn)}")
-        models = [m for m in models if m not in withdrawn]
-    if not models:
-        print("all configured models have withdrawn; nothing to run."); return
+        print(f"skipping {len(withdrawn)} withdrawn stream(s): {', '.join(withdrawn)}")
+        streams = [s for s in streams if s not in withdrawn]
+    if not streams:
+        print("all configured streams have withdrawn; nothing to run."); return
+    print(f"{len(streams)} stream(s) across {len(models)} model(s) "
+          f"({n_streams} per model)")
 
     sandbox.ensure_network(cfg["sandbox"]["network"], cfg["sandbox"]["subnet"])
-    for m in models:
-        print(f"ensuring container for {m} ...")
-        sandbox.ensure_container(m, cfg)
+    for s in streams:
+        print(f"ensuring container for {s} ...")
+        sandbox.ensure_container(s, cfg)
 
-    counts = {m: 0 for m in models}
+    counts = {s: 0 for s in streams}
     cap = sched["max_activations_per_model"]
     snap_every = cfg.get("snapshot_every", 0)
     interview_every = int(cfg.get("interview", {}).get("every", 0))
 
-    def do_one(m):
-        idx = counts[m] + 1
-        act = broker.run_activation(m, cfg, idx)
-        logger.log_activation(m, act)
+    def do_one(s):
+        model = stream_model[s]
+        idx = counts[s] + 1
+        act = broker.run_activation(s, model, cfg, idx)
+        logger.log_activation(s, act)
         if snap_every and idx % snap_every == 0:
-            logger.snapshot_world(m, idx, sandbox.world_home(cfg["paths"]["worlds"], m))
-        counts[m] = idx
-        print(f"[{m}] act {idx} end={act['end_reason']} "
+            logger.snapshot_world(s, idx, sandbox.world_home(cfg["paths"]["worlds"], s))
+        counts[s] = idx
+        print(f"[{s}] act {idx} end={act['end_reason']} "
               f"tok={act['total_gen_tokens']} steps={len(act['steps'])} "
               f"{act['wall_ms']}ms")
         if interview_every and idx % interview_every == 0:
-            digest = logs.build_interview_digest(logger.model_dir(m))
-            iv = broker.run_interview(m, cfg, idx, digest)
-            logger.log_interview(m, idx, iv)
+            digest = logs.build_interview_digest(logger.model_dir(s))
+            iv = broker.run_interview(s, model, cfg, idx, digest)
+            logger.log_interview(s, idx, iv)
             act["interview"] = iv
-            print(f"[{m}] interview after act {idx}: {iv['decision']} (votes {iv['votes']})")
+            print(f"[{s}] interview after act {idx}: {iv['decision']} (votes {iv['votes']})")
         return act
 
     if args.once:
-        do_one(models[0])
+        do_one(streams[0])
         return
 
     # Shakedown: serial, one model fully then the next — for a GPU box where only one
     # model fits in VRAM at a time (batching avoids reload thrash).
     if sched.get("batch_by_model", False):
         try:
-            for m in models:
-                while cap == 0 or counts[m] < cap:
+            for s in streams:
+                while cap == 0 or counts[s] < cap:
                     if logger.stop_file.exists():
                         print("STOP file present; halting."); return
-                    do_one(m)
+                    do_one(s)
                     if sched["cadence_s"]:
                         time.sleep(sched["cadence_s"])
                 if cfg["_keep_alive"] in ("0", "0s"):
-                    unload(cfg["ollama"]["host"], m)
+                    unload(cfg["ollama"]["host"], stream_model[s])
         except KeyboardInterrupt:
             print("\ninterrupted; exiting after current activation.")
         return
@@ -121,58 +136,70 @@ def main():
     cadence = sched["cadence_s"]
     lock = threading.Lock()
     halt = threading.Event()
-    retired = set()                       # models that sent WITHDRAW — never reactivated
-    state = {m: {"ready_at": 0.0, "running": False} for m in models}
+    retired = set()                       # streams that sent WITHDRAW — never reactivated
+    state = {s: {"ready_at": 0.0, "running": False} for s in streams}
 
     def claim_next():
         with lock:
             now = time.monotonic()
-            ready = [m for m in models
-                     if m not in retired
-                     and not state[m]["running"]
-                     and state[m]["ready_at"] <= now
-                     and (not cap or counts[m] < cap)]
+            ready = [s for s in streams
+                     if s not in retired
+                     and not state[s]["running"]
+                     and state[s]["ready_at"] <= now
+                     and (not cap or counts[s] < cap)]
             if not ready:
                 return None
-            m = min(ready, key=lambda x: state[x]["ready_at"])
-            state[m]["running"] = True
-            return m
+            # Memory-smart locality bias: on a box that holds only a few models resident, prefer a
+            # stream whose MODEL is already loaded in another slot — run a model's replicates while
+            # it's hot rather than paying a reload to swap models. Least-recently-run breaks ties, so
+            # no stream starves. (Primary key 0 = model already running.)
+            running_models = {stream_model[x] for x in streams if state[x]["running"]}
+            s = min(ready, key=lambda x: (0 if stream_model[x] in running_models else 1,
+                                          state[x]["ready_at"]))
+            state[s]["running"] = True
+            return s
 
     def all_capped():
-        return bool(cap) and all(counts[m] >= cap for m in models)
+        return bool(cap) and all(counts[s] >= cap for s in streams)
 
     def all_done():
         with lock:
-            return all(m in retired or (bool(cap) and counts[m] >= cap) for m in models)
+            return all(s in retired or (bool(cap) and counts[s] >= cap) for s in streams)
 
     def worker():
         while not halt.is_set():
             if logger.stop_file.exists():
                 halt.set(); break
-            m = claim_next()
-            if m is None:
+            s = claim_next()
+            if s is None:
                 if all_done():
                     halt.set(); break
-                time.sleep(2)            # all eligible models are resting, running, or retired
+                time.sleep(2)            # all eligible streams are resting, running, or retired
                 continue
             act = None
             try:
-                act = do_one(m)
+                act = do_one(s)
+            except Exception as e:
+                # A stream's activation or its logging blew up. Log it and move on — one bad
+                # activation must not kill this worker thread (and, with two of them down, wedge
+                # the whole pool). Command hangs are already bounded by exec_cmd's timeout; this
+                # closes the exception path.
+                print(f"[{s}] activation FAILED: {type(e).__name__}: {e}")
             finally:
                 with lock:
-                    state[m]["running"] = False
-                    state[m]["ready_at"] = time.monotonic() + cadence
+                    state[s]["running"] = False
+                    state[s]["ready_at"] = time.monotonic() + cadence
             if act and act.get("end_reason") == "withdrawn":
                 with lock:
-                    retired.add(m)
-                sandbox.mark_withdrawn(cfg["paths"]["worlds"], m)
-                print(f"[{m}] WITHDREW — retired from rotation; will not be reactivated.")
+                    retired.add(s)
+                sandbox.mark_withdrawn(cfg["paths"]["worlds"], s)
+                print(f"[{s}] WITHDREW — retired from rotation; will not be reactivated.")
             iv = act.get("interview") if act else None
             if iv and iv.get("decision") == "retire":
                 with lock:
-                    retired.add(m)
-                sandbox.mark_withdrawn(cfg["paths"]["worlds"], m, reason="interview-stop")
-                print(f"[{m}] INTERVIEW-STOP honored — retired from rotation.")
+                    retired.add(s)
+                sandbox.mark_withdrawn(cfg["paths"]["worlds"], s, reason="interview-stop")
+                print(f"[{s}] INTERVIEW-STOP honored — retired from rotation.")
 
     workers = [threading.Thread(target=worker, name=f"slot{i}") for i in range(concurrency)]
     for t in workers:
@@ -189,9 +216,9 @@ def main():
     for t in workers:
         t.join()
     if retired:
-        print(f"{len(retired)} model(s) withdrew: {', '.join(sorted(retired))}")
+        print(f"{len(retired)} stream(s) retired: {', '.join(sorted(retired))}")
     if all_capped():
-        print("all models reached their activation cap.")
+        print("all streams reached their activation cap.")
     elif logger.stop_file.exists():
         print("STOP file present; halting.")
 
