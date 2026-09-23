@@ -1,0 +1,10 @@
+runs/
+worlds*/
+*.img
+config.local.yaml
+config-long.yaml
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/

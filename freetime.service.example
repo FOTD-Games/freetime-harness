@@ -1,0 +1,19 @@
+# systemd --user unit for an unattended long run.
+#   cp freetime.service.example ~/.config/systemd/user/freetime.service
+#   (edit WorkingDirectory to wherever you cloned this repo)
+#   systemctl --user daemon-reload && systemctl --user start freetime
+# To survive logout/reboot: sudo loginctl enable-linger $USER
+[Unit]
+Description=Free-Time Model Harness (long run)
+After=network-online.target docker.service
+
+[Service]
+WorkingDirectory=%h/freetime-harness
+ExecStart=/usr/bin/python3 scheduler.py --config config-long.yaml
+Restart=on-failure
+RestartSec=60
+StandardOutput=append:%h/freetime-harness/longrun.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

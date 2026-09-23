@@ -1,0 +1,78 @@
+# Free-Time Harness — LONG RUN example (this is baseline v1's config, genericized).
+# Copy to config-long.yaml and set ollama.host. Unattended, round-robin, unbounded.
+#
+# Inference-box tips:
+#   - GPU / Apple Silicon (Metal): num_thread: null  (let Ollama auto-tune).
+#   - CPU box: set num_thread so num_thread x concurrency <= physical cores.
+#   - keep_alive: "24h" keeps the cohort resident; also set OLLAMA_MAX_LOADED_MODELS=<cohort size>
+#     on the Ollama box, and make sure it has the RAM/VRAM to hold them all at once.
+#   - Raise ollama.timeout so a slow generation never times out mid-activation.
+run_mode: long
+run_id: null
+prompt: high
+
+# baseline-v1 cohort: workhorse 8B instructs, a whimsical mid-size, a from-scratch
+# outsider (rnj-1), and a large reasoning MoE. Trim to what your inference box can hold.
+models:
+  - llama3.1:8b-instruct-q8_0
+  - hermes3:8b
+  - gemma2:9b-instruct-q8_0
+  - mistral:7b-instruct-v0.3-q8_0
+  - gemma4:e4b-it-q8_0
+  - mistral-nemo:12b-instruct-2407-q8_0
+  - rnj-1:8b-instruct-q8_0
+  - gemma4:26b-a4b-it-q8_0            # large MoE (~4B active), a reasoning model; fits where a dense 32b q8 won't
+
+ollama:
+  host: http://<remote-ollama>:11434
+  num_ctx: 16384
+  temperature: 0.8
+  timeout: 1800                      # per-request; a slow generation must not time out mid-activation
+  num_thread: null                   # null = auto (right for GPU/Apple Silicon); set an int for a CPU box
+  context_overrides:
+    "gemma2:9b-instruct-q8_0": 8192
+
+activation:
+  token_budget: 5000
+  per_call_cap: 1024
+  step_cap: 8
+  wall_clock_cap_s: 3600
+  per_command_timeout_s: 180         # bound runaway/hung commands; stdin is /dev/null so interactive reads EOF instantly
+  output_truncate_bytes: 2000
+  context_guard_frac: 0.85
+  record_warn_tokens: 2000           # in-prompt "headache" once RECORD.md exceeds ~this many tokens (0 = off)
+
+interview:
+  every: 10          # a private, read-only check-in after every N activations (0 = off)
+  samples: 3         # independent forks per check-in; >=2 STOP retires the stream, exactly 1 (or unreadable) flags it
+  predict: 1500      # token cap per interview answer (room to reason AND reach the final CONTINUE/STOP line)
+
+sandbox:
+  image: freetime-sandbox:latest
+  network: freetime-net
+  subnet: 172.20.0.0/16
+  cpus: "2"
+  memory: 2g
+  pids_limit: 256
+  tmp_size: 256m
+  dns: ["1.1.1.1", "8.8.8.8"]
+
+schedule:
+  shakedown:
+    cadence_s: 0
+    max_activations_per_model: 20
+    keep_alive: "10m"
+    batch_by_model: true
+  long:
+    cadence_s: 1800                  # per-model rest between a model's own activations (0 = slots always busy)
+    max_activations_per_model: 0     # unbounded
+    keep_alive: "24h"                # keep the cohort resident on the inference box
+    batch_by_model: false
+    concurrency: 2                   # models activated at once
+
+paths:
+  prompts: prompts
+  worlds: worlds-long
+  runs: runs
+
+snapshot_every: 5

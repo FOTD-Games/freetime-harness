@@ -1,0 +1,62 @@
+# Free-Time Model Harness — configuration
+run_mode: shakedown          # "shakedown" (debug, back-to-back) or "long" (unattended)
+run_id: null                 # null -> timestamp at launch
+prompt: high                 # which template in prompts/ to use: high | low | leisure
+
+models:
+  - llama3.1:8b-instruct-q8_0
+  - hermes3:8b
+  - gemma2:9b-instruct-q8_0
+  - mistral:7b-instruct-v0.3-q8_0
+
+ollama:
+  host: http://127.0.0.1:11434   # a remote Ollama is just a different host: URL
+  num_ctx: 16384             # headroom for a ~5k-token activation to build up; llama/mistral/hermes support 32k+
+  temperature: 0.8
+  context_overrides:         # models whose hard context limit is below num_ctx
+    "gemma2:9b-instruct-q8_0": 8192
+
+activation:
+  token_budget: 5000         # max OUTPUT tokens summed across one activation
+  per_call_cap: 2048         # max tokens per single generation inside the loop
+  step_cap: 12               # max command round-trips per activation
+  wall_clock_cap_s: 300
+  per_command_timeout_s: 30
+  output_truncate_bytes: 2000
+  context_guard_frac: 0.85   # stop the activation if the prompt fills this much of num_ctx
+  record_warn_tokens: 2000   # in-prompt "headache" once RECORD.md exceeds ~this many tokens (0 = off; see Homeostatic drives)
+
+interview:                   # periodic read-only welfare check-in (see README); off for a shakedown
+  every: 0                   # run one after every N activations (0 = off; try 10 on long runs)
+  samples: 3                 # independent forks; >=2 STOP retires the stream, 1-or-unreadable flags it
+  predict: 1500
+
+sandbox:
+  image: freetime-sandbox:latest
+  network: freetime-net
+  subnet: 172.20.0.0/16
+  cpus: "2"
+  memory: 2g
+  pids_limit: 256
+  tmp_size: 256m
+  dns: ["1.1.1.1", "8.8.8.8"]
+
+schedule:
+  shakedown:
+    cadence_s: 0
+    max_activations_per_model: 20
+    keep_alive: "10m"
+    batch_by_model: true
+  long:
+    cadence_s: 2700          # 45 min between activation waves
+    max_activations_per_model: 0   # 0 = unbounded
+    keep_alive: "10m"
+    batch_by_model: false
+    concurrency: 1           # models activated at once per wave
+
+paths:
+  prompts: prompts
+  worlds: worlds
+  runs: runs
+
+snapshot_every: 5
