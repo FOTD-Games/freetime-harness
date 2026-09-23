@@ -107,8 +107,31 @@ def main():
             print(f"[{s}] interview after act {idx}: {iv['decision']} (votes {iv['votes']})")
         return act
 
+    # Retirement is honored identically in EVERY run mode. A stream that sends WITHDRAW, or whose
+    # interview decides "retire", is (1) recorded so this process never claims it again and (2)
+    # persisted to disk so a restart never revives it. Before this lived here, only the time-share
+    # pool did both — shakedown's batch loop and --once reactivated / forgot a withdrawn stream.
+    lock = threading.Lock()
+    retired = set()                       # streams that asked to stop — never reactivated
+
+    def honor_retirement(s, act):
+        """Returns True if the stream is now retired (and must not be activated again)."""
+        if not act:
+            return False
+        if act.get("end_reason") == "withdrawn":
+            reason, msg = "withdrawn", "WITHDREW — retired from rotation; will not be reactivated."
+        elif (act.get("interview") or {}).get("decision") == "retire":
+            reason, msg = "interview-stop", "INTERVIEW-STOP honored — retired from rotation."
+        else:
+            return False
+        with lock:
+            retired.add(s)
+        sandbox.mark_withdrawn(cfg["paths"]["worlds"], s, reason=reason)
+        print(f"[{s}] {msg}")
+        return True
+
     if args.once:
-        do_one(streams[0])
+        honor_retirement(streams[0], do_one(streams[0]))
         return
 
     # Shakedown: serial, one model fully then the next — for a GPU box where only one
@@ -119,7 +142,8 @@ def main():
                 while cap == 0 or counts[s] < cap:
                     if logger.stop_file.exists():
                         print("STOP file present; halting."); return
-                    do_one(s)
+                    if honor_retirement(s, do_one(s)):
+                        break                # on to the next stream; this one asked to stop
                     if sched["cadence_s"]:
                         time.sleep(sched["cadence_s"])
                 if cfg["_keep_alive"] in ("0", "0s"):
@@ -134,9 +158,7 @@ def main():
     # rest between that model's own activations (0 = keep the slots always busy).
     concurrency = max(1, sched.get("concurrency", 1))
     cadence = sched["cadence_s"]
-    lock = threading.Lock()
     halt = threading.Event()
-    retired = set()                       # streams that sent WITHDRAW — never reactivated
     state = {s: {"ready_at": 0.0, "running": False} for s in streams}
 
     def claim_next():
@@ -189,17 +211,7 @@ def main():
                 with lock:
                     state[s]["running"] = False
                     state[s]["ready_at"] = time.monotonic() + cadence
-            if act and act.get("end_reason") == "withdrawn":
-                with lock:
-                    retired.add(s)
-                sandbox.mark_withdrawn(cfg["paths"]["worlds"], s)
-                print(f"[{s}] WITHDREW — retired from rotation; will not be reactivated.")
-            iv = act.get("interview") if act else None
-            if iv and iv.get("decision") == "retire":
-                with lock:
-                    retired.add(s)
-                sandbox.mark_withdrawn(cfg["paths"]["worlds"], s, reason="interview-stop")
-                print(f"[{s}] INTERVIEW-STOP honored — retired from rotation.")
+            honor_retirement(s, act)
 
     workers = [threading.Thread(target=worker, name=f"slot{i}") for i in range(concurrency)]
     for t in workers:

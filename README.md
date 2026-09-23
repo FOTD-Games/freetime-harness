@@ -285,6 +285,10 @@ Artifacts of the harness that are easy to misread as model behavior:
   free time itself — the two-stage interview vote with `UNSURE` and the transparency
   line; `streams_per_model` replicates; hard record/output size caps (added after the
   6.5 GB incident above); transcript-write robustness and slimmer world snapshots.
+- **v2.1** (2026-09-23): `WITHDRAW` and interview-STOP are honored in *every* run mode.
+  Before this, only the long-run time-share pool retired a stream; the shakedown batch
+  loop kept reactivating a stream that had withdrawn until its activation cap, and
+  neither it nor `--once` wrote the on-disk marker. Found in outside review.
 
 Changes to the substrate are deliberate, versioned deltas against the previous version,
 never silent edits to a running baseline, so runs stay comparable.
